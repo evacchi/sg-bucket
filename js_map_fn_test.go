@@ -10,20 +10,30 @@ package sgbucket
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"testing"
+
+	_ "embed"
 
 	"github.com/stretchr/testify/assert"
 )
 
+//go:embed "testdata/01_emit/dist/plugin.wasm"
+var Emit []byte
+
+//go:embed "testdata/03_inputparse/dist/plugin.wasm"
+var InputParse []byte
+
 func testCtx(t *testing.T) context.Context {
-	return context.TODO()
+	return context.Background() // return background for tests, to match sync_gateway interfaces
 }
 
 // Just verify that the calls to the emit() fn show up in the output.
 func TestEmitFunction(t *testing.T) {
 	ctx := testCtx(t)
-	mapper := NewJSMapFunction(ctx, `function(doc) {emit("key", "value"); emit("k2","v2")}`, 0)
+	emit := base64.StdEncoding.EncodeToString(Emit)
+	mapper := NewJSMapFunction(ctx, emit, 0)
 	rows, err := mapper.CallFunction(ctx, `{}`, "doc1", 0, 0)
 	assertNoError(t, err, "CallFunction failed")
 	assert.Equal(t, 2, len(rows))
@@ -48,7 +58,8 @@ func testMap(t *testing.T, mapFn string, doc string) []*ViewRow {
 
 // Now just make sure the input comes through intact
 func TestInputParse(t *testing.T) {
-	rows := testMap(t, `function(doc) {emit(doc.key, doc.value);}`,
+	inputParse := base64.StdEncoding.EncodeToString(InputParse)
+	rows := testMap(t, inputParse,
 		`{"key": "k", "value": "v"}`)
 	assert.Equal(t, 1, len(rows))
 	assert.Equal(t, &ViewRow{ID: "doc1", Key: "k", Value: "v"}, rows[0])

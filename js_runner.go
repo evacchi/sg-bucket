@@ -10,11 +10,13 @@ package sgbucket
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	extism "github.com/extism/go-sdk"
 	"github.com/robertkrimen/otto"
 )
 
@@ -23,7 +25,7 @@ import (
 // the result as the parameter value, instead of just converting it to a JS string.
 type JSONString string
 
-type NativeFunction func(otto.FunctionCall) otto.Value
+type NativeFunction extism.HostFunction
 
 // This specific instance will be returned if a call times out.
 var ErrJSTimeout = errors.New("javascript function timed out")
@@ -33,8 +35,10 @@ var ErrJSTimeout = errors.New("javascript function timed out")
 // call that function.
 // JSRunner is NOT thread-safe! For that, use JSServer, a wrapper around it.
 type JSRunner struct {
-	js       *otto.Otto
-	fn       otto.Value
+	hostFns []extism.HostFunction
+	fn      *extism.Plugin
+	fnInit  func(ctx context.Context) (*extism.Plugin, error)
+
 	fnSource string
 	timeout  time.Duration
 
@@ -43,7 +47,7 @@ type JSRunner struct {
 
 	// Optional function that will be called after the JS function returns, and can convert
 	// its output from JS (Otto) values to Go values.
-	After func(otto.Value, error) (interface{}, error)
+	After func([]byte, error) (interface{}, error)
 }
 
 // Creates a new JSRunner that will run a JavaScript function.
@@ -62,28 +66,14 @@ func (runner *JSRunner) Init(funcSource string, timeout time.Duration) error {
 }
 
 func (runner *JSRunner) InitWithLogging(funcSource string, timeout time.Duration, consoleErrorFunc func(string), consoleLogFunc func(string)) error {
-	runner.js = otto.New()
-	runner.fn = otto.UndefinedValue()
+	runner.fn = nil
 	runner.timeout = timeout
-
-	runner.DefineNativeFunction("log", func(call otto.FunctionCall) otto.Value {
-		var output string
-		for _, arg := range call.ArgumentList {
-			str, _ := arg.ToString()
-			output += str + " "
-		}
-		logg("JS: %s", output)
-		return otto.UndefinedValue()
-	})
 
 	if _, err := runner.SetFunction(funcSource); err != nil {
 		return err
 	}
 
-	return runner.js.Set("console", map[string]interface{}{
-		"error": consoleErrorFunc,
-		"log":   consoleLogFunc,
-	})
+	return nil
 
 }
 
@@ -97,16 +87,31 @@ func (runner *JSRunner) SetFunction(funcSource string) (bool, error) {
 		return false, nil // no-op
 	}
 	if funcSource == "" {
-		runner.fn = otto.UndefinedValue()
+		runner.fn = nil
 	} else {
-		fnobj, err := runner.js.Object("(" + funcSource + ")")
+
+		bytes, err := base64.StdEncoding.DecodeString(funcSource)
 		if err != nil {
 			return false, err
 		}
-		if fnobj.Class() != "Function" {
-			return false, errors.New("JavaScript source does not evaluate to a function")
+		manifest := extism.Manifest{
+			Wasm: []extism.Wasm{
+				extism.WasmData{Data: bytes},
+			},
 		}
-		runner.fn = fnobj.Value()
+
+		runner.fnInit = func(ctx context.Context) (*extism.Plugin, error) {
+			config := extism.PluginConfig{
+				EnableWasi: true,
+			}
+			plugin, err := extism.NewPlugin(
+				ctx, manifest, config, runner.hostFns)
+			if err != nil {
+				return nil, err
+			}
+			return plugin, nil
+		}
+
 	}
 	runner.fnSource = funcSource
 	return true, nil
@@ -117,12 +122,21 @@ func (runner *JSRunner) SetTimeout(timeout time.Duration) {
 	runner.timeout = timeout
 }
 
+func NewNativeFunction(
+	name string,
+	callback extism.HostFunctionStackCallback,
+	params []extism.ValueType,
+	returnTypes []extism.ValueType,
+) NativeFunction {
+	return NativeFunction(extism.NewHostFunctionWithStack(name, callback, params, returnTypes))
+}
+
 // Lets you define native helper functions (for example, the "emit" function to be called by
 // JS map functions) in the main namespace of the JS runtime.
 // This method is not thread-safe and should only be called before making any calls to the
 // main JS function.
 func (runner *JSRunner) DefineNativeFunction(name string, function NativeFunction) {
-	_ = runner.js.Set(name, (func(otto.FunctionCall) otto.Value)(function))
+	runner.hostFns = append(runner.hostFns, extism.HostFunction(function))
 }
 
 func (runner *JSRunner) jsonToValue(jsonStr string) (interface{}, error) {
@@ -139,7 +153,7 @@ func (runner *JSRunner) jsonToValue(jsonStr string) (interface{}, error) {
 // ToValue calls ToValue on the otto instance.  Required for conversion of
 // complex types to otto Values.
 func (runner *JSRunner) ToValue(value interface{}) (otto.Value, error) {
-	return runner.js.ToValue(value)
+	panic("not implemented")
 }
 
 // Invokes the JS function with JSON inputs.
@@ -147,24 +161,28 @@ func (runner *JSRunner) CallWithJSON(inputs ...string) (interface{}, error) {
 	if runner.Before != nil {
 		runner.Before()
 	}
-
-	var result otto.Value
+	var result uint32
+	var output []byte
 	var err error
-	if runner.fn.IsUndefined() {
-		result = otto.UndefinedValue()
-	} else {
-		inputJS := make([]interface{}, len(inputs))
-		for i, inputStr := range inputs {
-			inputJS[i], err = runner.jsonToValue(inputStr)
-			if err != nil {
-				return nil, err
-			}
+	if runner.fnInit != nil {
+		runner.fn, err = runner.fnInit(context.Background())
+		if err != nil {
+			return nil, err
 		}
-		result, err = runner.fn.Call(runner.fn, inputJS...)
 	}
+	if runner.fn != nil {
+		if len(inputs) > 1 {
+			panic("unsupported input size")
+		}
+		// Make a JSON array out of the arg list
+		result, output, err = runner.fn.Call("transform", []byte(inputs[0]))
+	}
+
 	if runner.After != nil {
-		return runner.After(result, err)
+		return runner.After(output, err)
 	}
+
+	_ = result
 	return nil, err
 }
 
@@ -174,60 +192,34 @@ func (runner *JSRunner) Call(_ context.Context, inputs ...interface{}) (_ interf
 		runner.Before()
 	}
 
-	var result otto.Value
-	if runner.fn.IsUndefined() {
-		result = otto.UndefinedValue()
-	} else {
-		inputJS := make([]interface{}, len(inputs))
-		for i, input := range inputs {
-			if jsonStr, ok := input.(JSONString); ok {
-				if input, err = runner.jsonToValue(string(jsonStr)); err != nil {
-					return nil, err
-				}
-			}
-			inputJS[i], err = runner.js.ToValue(input)
-			if err != nil {
-				return nil, fmt.Errorf("Couldn't convert %#v to JS: %s", input, err)
-			}
+	var result uint32
+	var output []byte
+	if runner.fnInit != nil {
+		runner.fn, err = runner.fnInit(context.Background())
+		if err != nil {
+			return nil, err
+		}
+	}
+	if runner.fn != nil {
+
+		input, err := json.Marshal(inputs[0])
+		if err != nil {
+			return nil, err
 		}
 
-		var completed chan struct{}
 		timeout := runner.timeout
-		if timeout > 0 {
-			completed = make(chan struct{})
-			defer func() {
-				if caught := recover(); caught != nil {
-					if caught == ErrJSTimeout {
-						err = ErrJSTimeout
-						return
-					}
-					panic(caught)
-				}
-			}()
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
 
-			runner.js.Interrupt = make(chan func(), 1)
-			timer := time.NewTimer(timeout)
-			go func() {
-				defer timer.Stop()
-
-				select {
-				case <-completed:
-					return
-				case <-timer.C:
-					runner.js.Interrupt <- func() {
-						panic(ErrJSTimeout)
-					}
-				}
-			}()
-		}
-
-		result, err = runner.fn.Call(runner.fn, inputJS...)
-		if completed != nil {
-			close(completed)
+		result, output, err = runner.fn.CallWithContext(ctx, "transform", []byte(input))
+		if err != nil {
+			return nil, err
 		}
 	}
 	if runner.After != nil {
-		return runner.After(result, err)
+		return runner.After(output, err)
 	}
+
+	_ = result
 	return nil, err
 }

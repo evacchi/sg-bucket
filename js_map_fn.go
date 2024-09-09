@@ -10,10 +10,10 @@ package sgbucket
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"time"
 
-	"github.com/robertkrimen/otto"
+	extism "github.com/extism/go-sdk"
 )
 
 const kTaskCacheSize = 4
@@ -33,21 +33,27 @@ func newJsMapTask(funcSource string, timeout time.Duration) (JSServerTask, error
 		return nil, err
 	}
 
-	// Implementation of the 'emit()' callback:
-	mapper.DefineNativeFunction("emit", func(call otto.FunctionCall) otto.Value {
-		key, err1 := call.ArgumentList[0].Export()
-		value, err2 := call.ArgumentList[1].Export()
-		if err1 != nil || err2 != nil {
-			panic(fmt.Sprintf("Unsupported key or value types: emit(%#v,%#v): %v %v", key, value, err1, err2))
-		}
-		mapper.output = append(mapper.output, &ViewRow{Key: key, Value: value})
-		return otto.UndefinedValue()
-	})
+	mapper.DefineNativeFunction("emit", NewNativeFunction(
+		"emit",
+		func(ctx context.Context, p *extism.CurrentPlugin, stack []uint64) {
+			bytes, err := p.ReadBytes(stack[0])
+			if err != nil {
+				panic(err)
+			}
+
+			var row ViewRow
+			json.Unmarshal(bytes, &row)
+
+			mapper.output = append(mapper.output, &row)
+		},
+		[]extism.ValueType{extism.ValueTypePTR},
+		[]extism.ValueType{},
+	))
 
 	mapper.Before = func() {
 		mapper.output = []*ViewRow{}
 	}
-	mapper.After = func(result otto.Value, err error) (interface{}, error) {
+	mapper.After = func(result []byte, err error) (interface{}, error) {
 		output := mapper.output
 		mapper.output = nil
 		return output, err
@@ -55,9 +61,7 @@ func newJsMapTask(funcSource string, timeout time.Duration) (JSServerTask, error
 	return mapper, nil
 }
 
-//////// JSMapFunction
-
-// A thread-safe wrapper around a jsMapTask, i.e. a Couchbase-Server-compatible JavaScript
+// JSMapFunction is a thread-safe wrapper around a jsMapTask, i.e. a Couchbase-Server-compatible JavaScript
 // 'map' function.
 type JSMapFunction struct {
 	*JSServer
@@ -72,9 +76,23 @@ func NewJSMapFunction(ctx context.Context, fnSource string, timeout time.Duratio
 	}
 }
 
+type FunctionInput struct {
+	Doc  string `json:"doc"`
+	Meta string `json:"meta"`
+}
+
 // Calls a jsMapTask.
 func (mapper *JSMapFunction) CallFunction(ctx context.Context, doc string, docid string, vbNo uint32, vbSeq uint64) ([]*ViewRow, error) {
-	result1, err := mapper.Call(ctx, JSONString(doc), MakeMeta(docid, vbNo, vbSeq))
+	meta, err := json.Marshal(MakeMeta(docid, vbNo, vbSeq))
+	if err != nil {
+		return nil, err
+	}
+	result1, err := mapper.Call(ctx,
+		FunctionInput{
+			Doc:  doc,
+			Meta: string(meta),
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
