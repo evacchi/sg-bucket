@@ -10,12 +10,13 @@ package sgbucket
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"testing"
 
 	_ "embed"
 
+	extism "github.com/extism/go-sdk"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -32,8 +33,13 @@ func testCtx(t *testing.T) context.Context {
 // Just verify that the calls to the emit() fn show up in the output.
 func TestEmitFunction(t *testing.T) {
 	ctx := testCtx(t)
-	emit := base64.StdEncoding.EncodeToString(Emit)
-	mapper := NewJSMapFunction(ctx, emit, 0)
+	manifest := extism.Manifest{
+		Wasm: []extism.Wasm{extism.WasmData{Data: Emit}},
+	}
+	emit, err := json.Marshal(manifest)
+	assert.NoError(t, err)
+
+	mapper := NewJSMapFunction(ctx, string(emit), 0)
 	rows, err := mapper.CallFunction(ctx, `{}`, "doc1", 0, 0)
 	assertNoError(t, err, "CallFunction failed")
 	assert.Equal(t, 2, len(rows))
@@ -58,8 +64,12 @@ func testMap(t *testing.T, mapFn string, doc string) []*ViewRow {
 
 // Now just make sure the input comes through intact
 func TestInputParse(t *testing.T) {
-	inputParse := base64.StdEncoding.EncodeToString(InputParse)
-	rows := testMap(t, inputParse,
+	manifest := extism.Manifest{
+		Wasm: []extism.Wasm{extism.WasmData{Data: InputParse}},
+	}
+	inputParse, err := json.Marshal(manifest)
+	assert.NoError(t, err)
+	rows := testMap(t, string(inputParse),
 		`{"key": "k", "value": "v"}`)
 	assert.Equal(t, 1, len(rows))
 	assert.Equal(t, &ViewRow{ID: "doc1", Key: "k", Value: "v"}, rows[0])

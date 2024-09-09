@@ -10,7 +10,6 @@ package sgbucket
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,14 +89,10 @@ func (runner *JSRunner) SetFunction(funcSource string) (bool, error) {
 		runner.fn = nil
 	} else {
 
-		bytes, err := base64.StdEncoding.DecodeString(funcSource)
+		manifest := extism.Manifest{}
+		err := json.Unmarshal([]byte(funcSource), &manifest)
 		if err != nil {
 			return false, err
-		}
-		manifest := extism.Manifest{
-			Wasm: []extism.Wasm{
-				extism.WasmData{Data: bytes},
-			},
 		}
 
 		runner.fnInit = func(ctx context.Context) (*extism.Plugin, error) {
@@ -137,17 +132,6 @@ func NewNativeFunction(
 // main JS function.
 func (runner *JSRunner) DefineNativeFunction(name string, function NativeFunction) {
 	runner.hostFns = append(runner.hostFns, extism.HostFunction(function))
-}
-
-func (runner *JSRunner) jsonToValue(jsonStr string) (interface{}, error) {
-	if jsonStr == "" {
-		return otto.NullValue(), nil
-	}
-	var parsed interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return nil, fmt.Errorf("Unparseable JSRunner input: %s", jsonStr)
-	}
-	return parsed, nil
 }
 
 // ToValue calls ToValue on the otto instance.  Required for conversion of
